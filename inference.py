@@ -36,7 +36,11 @@ def encode_audio_mimi(audio_path: str, sample_rate: int = 24000,
     input_values = inputs["input_values"].to(device)
 
     with torch.no_grad():
-        codes = mimi.encode(input_values).audio_codes[0, 0, :num_codebooks, :].T
+        audio_codes = mimi.encode(input_values).audio_codes
+        if audio_codes.dim() == 4:
+            codes = audio_codes[0, 0, :num_codebooks, :].T
+        else:
+            codes = audio_codes[0, :num_codebooks, :].T
 
     return codes, duration
 

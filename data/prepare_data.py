@@ -50,8 +50,12 @@ def encode_audio_with_mimi(
     # Encode with Mimi
     with torch.no_grad():
         encoder_outputs = mimi_model.encode(input_values)
-        # audio_codes shape: [batch, 1, num_codebooks_total, T_frames]
-        codes = encoder_outputs.audio_codes[0, 0, :num_codebooks, :].T  # [T, Q]
+        # audio_codes shape can be [B, codebooks, T] or [B, 1, codebooks, T]
+        codes = encoder_outputs.audio_codes
+        if codes.dim() == 4:
+            codes = codes[0, 0, :num_codebooks, :].T  # [T, Q]
+        else:
+            codes = codes[0, :num_codebooks, :].T      # [T, Q]
 
     return codes.cpu().numpy()
 
