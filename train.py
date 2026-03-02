@@ -120,11 +120,16 @@ def train(config: DsmAsrConfig, args):
     model = model.to(device)
 
     # ── Optimizer ────────────────────────────────────────────────────
-    audio_params = list(model.audio_embeddings.parameters()) + [model.audio_scale]
+    # Audio params (embeddings + adapter) get higher LR to learn fast
+    audio_params = (
+        list(model.audio_embeddings.parameters()) +
+        list(model.audio_adapter.parameters()) +
+        [model.audio_scale]
+    )
     backbone_params = list(model.backbone.parameters())
 
     optimizer = torch.optim.AdamW([
-        {"params": audio_params, "lr": config.learning_rate * 10},
+        {"params": audio_params, "lr": config.learning_rate * config.audio_lr_multiplier},
         {"params": backbone_params, "lr": config.learning_rate},
     ], weight_decay=config.weight_decay)
 
