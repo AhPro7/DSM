@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from tqdm import tqdm
 
@@ -142,7 +142,7 @@ def train(config: DsmAsrConfig, args):
     # ── Mixed precision ──────────────────────────────────────────────
     use_amp = config.bf16 or config.fp16
     amp_dtype = torch.bfloat16 if config.bf16 else torch.float16
-    scaler = GradScaler(enabled=config.fp16)
+    scaler = GradScaler('cuda', enabled=config.fp16)
 
     # ── WandB ────────────────────────────────────────────────────────
     if config.use_wandb or args.use_wandb:
