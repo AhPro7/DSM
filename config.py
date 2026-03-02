@@ -1,6 +1,7 @@
 """
 DSM-ASR Configuration
-Central configuration for the Delayed Streams Modeling ASR system.
+Central configuration for the Audio-Prefix ASR system.
+Audio tokens (from Mimi) serve as prefix, model generates text autoregressively.
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -10,28 +11,28 @@ from typing import Optional
 class DsmAsrConfig:
     """All hyperparameters for DSM-ASR training and inference."""
 
-    # ── Model paths ──────────────────────────────────────────────────────
+    # ── Model paths ──────────────────────────────────────────────────
     qwen_model: str = "Qwen/Qwen3-0.6B-Base"
     mimi_model: str = "kyutai/mimi"
 
-    # ── Audio (Mimi) ─────────────────────────────────────────────────────
+    # ── Audio (Mimi) ─────────────────────────────────────────────────
     sample_rate: int = 24_000          # Mimi native sample rate
     frame_rate: float = 12.5           # Mimi frame rate (Hz)
     num_codebooks: int = 8             # Use first 8 of 32 codebooks (most semantic)
     audio_vocab_size: int = 2048       # Mimi codebook vocab size
     audio_pad_token: int = 2048        # PAD token for audio (= vocab_size, extra slot)
 
-    # ── Text / DSM ───────────────────────────────────────────────────────
-    delay_frames: int = 4              # Text delay τ = 4 frames = 320ms at 12.5Hz
-    text_pad_token_id: int = -100      # Ignored by cross-entropy loss
-    # Special tokens we add to the Qwen tokenizer
-    special_tokens: list = field(default_factory=lambda: ["<|pad|>", "<|word|>"])
+    # ── Special tokens ───────────────────────────────────────────────
+    # <|start_text|> separates audio prefix from text generation
+    # <|end_text|> marks end of transcription
+    special_tokens: list = field(default_factory=lambda: ["<|start_text|>", "<|end_text|>"])
 
-    # ── Sequence lengths ─────────────────────────────────────────────────
+    # ── Sequence lengths ─────────────────────────────────────────────
     max_audio_duration: float = 30.0   # Maximum audio duration in seconds
-    max_seq_len: int = 512             # Max number of frames (30s * 12.5 = 375)
+    max_text_tokens: int = 256         # Maximum text tokens in output
+    max_seq_len: int = 640             # Max total sequence (audio frames + text tokens)
 
-    # ── Training ─────────────────────────────────────────────────────────
+    # ── Training ─────────────────────────────────────────────────────
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
     batch_size: int = 4
@@ -43,7 +44,7 @@ class DsmAsrConfig:
     fp16: bool = False
     bf16: bool = True
 
-    # ── Data ─────────────────────────────────────────────────────────────
+    # ── Data ─────────────────────────────────────────────────────────
     dataset_name: str = "nadsoft/auto-stt-22-2-2026_cleaned-dataset"
     audio_column: str = "audio"
     text_column: str = "normalized_text"
@@ -52,12 +53,12 @@ class DsmAsrConfig:
     eval_ratio: float = 0.05           # 5% for eval if no eval split
     preprocessing_num_workers: int = 4
 
-    # ── Paths ────────────────────────────────────────────────────────────
+    # ── Paths ────────────────────────────────────────────────────────
     output_dir: str = "./output"
     cache_dir: str = "./cache"
     preprocessed_dir: str = "./preprocessed_data"
 
-    # ── Logging ──────────────────────────────────────────────────────────
+    # ── Logging ──────────────────────────────────────────────────────
     use_wandb: bool = False
     wandb_project: str = "dsm-asr"
     log_every_n_steps: int = 10
