@@ -255,6 +255,19 @@ def train(config: DsmAsrConfig, args):
         if args.max_steps is not None and global_step >= args.max_steps:
             break
 
+    # Final eval + save best if not saved yet
+    if len(eval_ds) > 0:
+        print(f"\n🔍 Final evaluation...")
+        final_metrics = evaluate(model, eval_loader, tokenizer, device)
+        print(f"   Final eval loss: {final_metrics['eval_loss']:.4f}")
+        if final_metrics["eval_loss"] < best_eval_loss:
+            best_eval_loss = final_metrics["eval_loss"]
+
+    # Always save best (use final model if no eval was done)
+    if not (output_dir / "best" / "model.pt").exists():
+        save_checkpoint(model, tokenizer, config, output_dir / "best", global_step)
+        print(f"   💾 Saved best checkpoint")
+
     save_checkpoint(model, tokenizer, config, output_dir / "final", global_step)
     with open(output_dir / "training_log.json", "w") as f:
         json.dump(train_losses, f, indent=2)
