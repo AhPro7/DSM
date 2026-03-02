@@ -48,7 +48,7 @@ class DsmAsrModel(nn.Module):
         print(f"🧠 Loading Qwen3 backbone: {config.qwen_model}")
         self.backbone = AutoModelForCausalLM.from_pretrained(
             config.qwen_model,
-            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            dtype=torch.bfloat16 if config.bf16 else torch.float32,
             trust_remote_code=True,
             attn_implementation="sdpa",
         )
@@ -142,6 +142,10 @@ class DsmAsrModel(nn.Module):
         # 2. Concatenate: [audio_prefix | text_sequence]
         combined_emb = torch.cat([audio_emb, text_emb], dim=1)  # [B, T_audio + N_text, D]
 
+        # Cast to backbone dtype (audio embs are float32, backbone may be bfloat16)
+        backbone_dtype = next(self.backbone.model.embed_tokens.parameters()).dtype
+        combined_emb = combined_emb.to(dtype=backbone_dtype)
+
         # 3. Build attention mask (1 for valid, 0 for padding)
         attention_mask = torch.zeros(B, total_len, device=audio_tokens.device, dtype=combined_emb.dtype)
         for i in range(B):
@@ -228,6 +232,8 @@ class DsmAsrModel(nn.Module):
 
             # Concat audio prefix + text so far
             combined = torch.cat([audio_emb, text_emb], dim=1)
+            backbone_dtype = next(self.backbone.model.embed_tokens.parameters()).dtype
+            combined = combined.to(dtype=backbone_dtype)
             attention_mask = torch.ones(1, combined.shape[1], device=device, dtype=combined.dtype)
 
             # Forward
