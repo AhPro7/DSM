@@ -295,7 +295,11 @@ class DsmAsrModel(nn.Module):
                 new_token_emb = self.get_text_embedding(
                     torch.tensor([[generated[-1]]], dtype=torch.long, device=device)
                 ).to(dtype=backbone_dtype)
-                cache_len = past_key_values[0][0].shape[2]
+                # Handle both DynamicCache (new) and tuple (old) formats
+                if hasattr(past_key_values, 'get_seq_length'):
+                    cache_len = past_key_values.get_seq_length()
+                else:
+                    cache_len = past_key_values[0][0].shape[2]
                 attention_mask = torch.ones(1, cache_len + 1, device=device, dtype=backbone_dtype)
                 outputs = self.backbone(
                     inputs_embeds=new_token_emb,
