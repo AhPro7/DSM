@@ -4,7 +4,6 @@ datasets[audio]
 accelerate
 soundfile
 librosa
-whisper-timestamped
 tqdm
 jiwer
 wandb
