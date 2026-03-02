@@ -1,0 +1,10 @@
+torch>=2.1.0
+transformers>=4.51.0
+datasets[audio]
+accelerate
+soundfile
+librosa
+whisper-timestamped
+tqdm
+jiwer
+wandb
