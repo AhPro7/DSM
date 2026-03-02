@@ -1,8 +1,12 @@
 """
-DSM-ASR Data Collator
+DSM-ASR Data Collator (Audio Prefix → Text Generation)
 
-Custom collator for batching variable-length DSM sequences.
-Handles padding of audio tokens, text tokens, and masks.
+Builds the full training sequence by concatenating audio embeddings + text tokens.
+Handles padding across variable-length samples in a batch.
+
+Sequence layout per sample:
+    [AUDIO_1, ..., AUDIO_T, START_TEXT, text_1, ..., text_N] ← input
+    [-100,    ..., -100,    text_1,     ...,    text_N, END]  ← target (loss only on text)
 """
 import torch
 from typing import Dict, List
@@ -16,57 +20,59 @@ from config import DsmAsrConfig
 @dataclass
 class DsmAsrCollator:
     """
-    Pads variable-length DSM samples to form a batch.
+    Collates variable-length audio+text samples into padded batches.
     
-    Padding strategy:
-    - audio_tokens: padded with audio_pad_token
-    - text_tokens: padded with pad_token_id (from tokenizer)
-    - text_targets: padded with -100 (ignored by CE loss)
-    - text_loss_mask: padded with 0.0
-    - attention_mask: padded with 0.0
+    Returns a batch dict with:
+    - audio_tokens:    [B, T_audio_max, Q]  padded audio codebook indices
+    - text_input_ids:  [B, N_text_max]      padded text input token IDs
+    - text_target_ids: [B, N_text_max]      padded text target token IDs (-100 for pad)
+    - audio_lengths:   [B]                  actual audio lengths per sample
+    - text_lengths:    [B]                  actual text lengths per sample
     """
-
     config: DsmAsrConfig
-    pad_token_id: int  # Text pad token ID from tokenizer
+    text_pad_token_id: int  # Usually 0 or tokenizer.pad_token_id
 
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        # Find max sequence length in this batch
-        max_len = max(sample["audio_tokens"].shape[0] for sample in batch)
         batch_size = len(batch)
         Q = self.config.num_codebooks
 
+        # Get max lengths
+        max_audio_len = max(s["audio_tokens"].shape[0] for s in batch)
+        max_text_len = max(s["text_input_ids"].shape[0] for s in batch)
+
         # Pre-allocate padded tensors
         audio_tokens = torch.full(
-            (batch_size, max_len, Q),
+            (batch_size, max_audio_len, Q),
             self.config.audio_pad_token,
             dtype=torch.long,
         )
-        text_tokens = torch.full(
-            (batch_size, max_len),
-            self.pad_token_id,
+        text_input_ids = torch.full(
+            (batch_size, max_text_len),
+            self.text_pad_token_id,
             dtype=torch.long,
         )
-        text_targets = torch.full(
-            (batch_size, max_len),
+        text_target_ids = torch.full(
+            (batch_size, max_text_len),
             -100,  # Ignored by cross-entropy
             dtype=torch.long,
         )
-        text_loss_mask = torch.zeros(batch_size, max_len, dtype=torch.float32)
-        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.float32)
+        audio_lengths = torch.zeros(batch_size, dtype=torch.long)
+        text_lengths = torch.zeros(batch_size, dtype=torch.long)
 
-        # Fill in actual values
         for i, sample in enumerate(batch):
-            T = sample["audio_tokens"].shape[0]
-            audio_tokens[i, :T] = sample["audio_tokens"]
-            text_tokens[i, :T] = sample["text_tokens"]
-            text_targets[i, :T] = sample["text_targets"]
-            text_loss_mask[i, :T] = sample["text_loss_mask"]
-            attention_mask[i, :T] = sample["attention_mask"]
+            T_a = sample["audio_tokens"].shape[0]
+            T_t = sample["text_input_ids"].shape[0]
+
+            audio_tokens[i, :T_a] = sample["audio_tokens"]
+            text_input_ids[i, :T_t] = sample["text_input_ids"]
+            text_target_ids[i, :T_t] = sample["text_target_ids"]
+            audio_lengths[i] = T_a
+            text_lengths[i] = T_t
 
         return {
-            "audio_tokens": audio_tokens,        # [B, T, Q]
-            "text_tokens": text_tokens,           # [B, T]
-            "text_targets": text_targets,          # [B, T]
-            "text_loss_mask": text_loss_mask,      # [B, T]
-            "attention_mask": attention_mask,       # [B, T]
+            "audio_tokens": audio_tokens,        # [B, T_audio, Q]
+            "text_input_ids": text_input_ids,     # [B, N_text]
+            "text_target_ids": text_target_ids,   # [B, N_text]  (-100 for padding)
+            "audio_lengths": audio_lengths,       # [B]
+            "text_lengths": text_lengths,          # [B]
         }
