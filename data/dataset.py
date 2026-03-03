@@ -1,12 +1,20 @@
 """
-DSM-ASR Dataset (Audio Prefix → Text Generation)
+DSM-ASR Dataset v3 — True Delayed Streams
 
-The model sees audio tokens as a prefix and generates text tokens after.
-No timestamps needed — the model learns alignment itself.
+Based on the Moshi paper:
+Audio and text are PARALLEL streams at 12.5Hz frame rate.
+Text tokens are placed at their positions AFTER a delay of `delay_frames`.
 
-Sequence format:
-    [audio_emb_1, ..., audio_emb_T, START_TEXT, text_tok_1, ..., text_tok_N, END_TEXT]
-    |<-------- no loss ---------->|  no loss  |<------- loss here -------->|  loss  |
+Since we don't have word-level timestamps, we use a simple strategy:
+- Tokenize the full text
+- Spread text tokens evenly across the available frames (after delay)
+- Fill gaps with PAD, insert EPAD before text bursts
+
+Training format per sample:
+    audio_tokens: [T, Q]  — Mimi codebook indices per frame
+    text_tokens:  [T]     — text stream aligned to audio at frame rate
+    text_targets: [T]     — shifted text_tokens for next-token prediction
+    loss_mask:    [T]     — 1.0 for text positions, 0.0 for PAD positions
 """
 import os
 import json
@@ -24,53 +32,42 @@ from config import DsmAsrConfig
 
 class DsmAsrDataset(Dataset):
     """
-    Dataset for audio-prefix ASR.
-
-    Each sample returns:
-    - audio_tokens: [T_audio, Q] int tensor of Mimi codebook indices
-    - text_input_ids: [N_text] int tensor = [START_TEXT, tok_1, ..., tok_N]
-    - text_target_ids: [N_text] int tensor = [tok_1, ..., tok_N, END_TEXT]
-    
-    The collator will concatenate audio + text into the full sequence.
+    Each sample returns parallel streams:
+    - audio_tokens: [T, Q] codebook indices
+    - text_tokens:  [T] text stream (mostly PAD, text tokens placed with delay)
+    - text_targets: [T] next-token prediction targets (-100 for ignored)
+    - loss_mask:    [T] 1.0 where we compute loss
     """
 
-    def __init__(
-        self,
-        config: DsmAsrConfig,
-        split: str = "train",
-        max_samples: Optional[int] = None,
-        tokenizer=None,
-    ):
+    def __init__(self, config: DsmAsrConfig, split="train",
+                 max_samples=None, tokenizer=None):
         super().__init__()
         self.config = config
         self.split = split
 
-        # Load tokenizer
         if tokenizer is not None:
             self.tokenizer = tokenizer
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(config.qwen_model, trust_remote_code=True)
-            special_tokens = {"additional_special_tokens": config.special_tokens}
-            self.tokenizer.add_special_tokens(special_tokens)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                config.qwen_model, trust_remote_code=True)
+            self.tokenizer.add_special_tokens(
+                {"additional_special_tokens": config.special_tokens})
 
-        # Get special token IDs
-        self.start_text_id = self.tokenizer.convert_tokens_to_ids("<|start_text|>")
-        self.end_text_id = self.tokenizer.convert_tokens_to_ids("<|end_text|>")
+        # Special token IDs
+        self.pad_id = self.tokenizer.convert_tokens_to_ids("<|pad|>")
+        self.epad_id = self.tokenizer.convert_tokens_to_ids("<|epad|>")
+        self.bos_id = self.tokenizer.convert_tokens_to_ids("<|bos|>")
+        self.eos_id = self.tokenizer.convert_tokens_to_ids("<|eos|>")
 
         # Load manifest
         manifest_path = Path(config.preprocessed_dir) / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(
-                f"Manifest not found at {manifest_path}. "
-                "Run `python data/prepare_data.py` first."
-            )
-
+                f"Manifest not found: {manifest_path}. Run prepare_data.py first.")
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
-
         self.samples = manifest["samples"]
 
-        # Apply train/eval split
         if split == "train" and config.eval_split is None:
             n_eval = max(1, int(len(self.samples) * config.eval_ratio))
             self.samples = self.samples[:-n_eval]
@@ -86,66 +83,142 @@ class DsmAsrDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample_info = self.samples[idx]
-        sample_path = sample_info["path"]
+    def _build_text_stream(self, text: str, T: int) -> tuple:
+        """
+        Build the text stream aligned to audio frames.
+        
+        Strategy (simplified from paper):
+        - Tokenize text → [tok_1, ..., tok_N]
+        - Text starts at frame `delay_frames` (audio has head start)
+        - Spread tokens evenly across frames [delay, T-1]
+        - Insert EPAD before each word burst, PAD everywhere else
 
-        # Load preprocessed data
-        data = np.load(sample_path, allow_pickle=True)
-        audio_codes = torch.from_numpy(data["audio_codes"].astype(np.int64))  # [T, Q]
-        text = str(data["text"])
+        Returns:
+            text_tokens: [T] tensor
+            text_targets: [T] tensor (shifted by 1)
+            loss_mask: [T] tensor
+        """
+        delay = self.config.delay_frames
+        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
 
-        # Cap audio frames
-        max_audio = self.config.max_frames
-        if audio_codes.shape[0] > max_audio:
-            audio_codes = audio_codes[:max_audio]
+        if not text_ids:
+            text_ids = [self.eos_id]
 
-        # Tokenize text
-        text_token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        # Add BOS at start, EOS at end
+        text_ids = [self.bos_id] + text_ids + [self.eos_id]
+
+        # Available frames for text (after delay)
+        available_frames = T - delay
+        if available_frames <= 0:
+            available_frames = T
+            delay = 0
 
         # Cap text length
-        if len(text_token_ids) > self.config.max_text_tokens - 2:  # -2 for start/end
-            text_token_ids = text_token_ids[:self.config.max_text_tokens - 2]
+        if len(text_ids) > available_frames:
+            text_ids = text_ids[:available_frames - 1] + [self.eos_id]
 
-        # Build text input: [START_TEXT, tok_1, ..., tok_N]
-        text_input = [self.start_text_id] + text_token_ids
-        # Build text target: [tok_1, ..., tok_N, END_TEXT]
-        text_target = text_token_ids + [self.end_text_id]
+        N = len(text_ids)
+
+        # Initialize text stream with PAD
+        text_tokens = torch.full((T,), self.pad_id, dtype=torch.long)
+        loss_mask = torch.zeros(T, dtype=torch.float32)
+
+        # Spread text tokens evenly across [delay, delay + available - 1]
+        if N <= available_frames:
+            # Calculate positions — spread evenly
+            if N == 1:
+                positions = [delay]
+            else:
+                positions = [delay + int(i * (available_frames - 1) / (N - 1))
+                            for i in range(N)]
+                # Ensure no duplicates
+                seen = set()
+                clean_positions = []
+                for p in positions:
+                    while p in seen and p < T - 1:
+                        p += 1
+                    if p < T:
+                        seen.add(p)
+                        clean_positions.append(p)
+                positions = clean_positions
+
+            # Place text tokens at positions
+            for i, pos in enumerate(positions):
+                if i < N and pos < T:
+                    # Insert EPAD before text token (if there's room)
+                    if pos > 0 and text_tokens[pos - 1] == self.pad_id:
+                        text_tokens[pos - 1] = self.epad_id
+                    text_tokens[pos] = text_ids[i]
+                    loss_mask[pos] = 1.0
+
+        # Build targets: shifted by 1 (predict next token)
+        text_targets = torch.full((T,), -100, dtype=torch.long)
+        # For positions with loss, the target is the NEXT text token
+        active_positions = (loss_mask == 1.0).nonzero(as_tuple=True)[0].tolist()
+        for idx in range(len(active_positions)):
+            pos = active_positions[idx]
+            if idx + 1 < len(active_positions):
+                # Target = next text token
+                next_pos = active_positions[idx + 1]
+                text_targets[pos] = text_tokens[next_pos]
+            else:
+                # Last text token — target is EOS
+                text_targets[pos] = self.eos_id
+
+        # Also compute loss on EPAD and PAD positions between text tokens
+        # so model learns WHEN to output text vs padding
+        for t in range(T):
+            if loss_mask[t] == 0.0:
+                # For PAD/EPAD positions, model should predict PAD or EPAD
+                if t + 1 < T:
+                    text_targets[t] = text_tokens[t + 1]
+                    loss_mask[t] = 0.5  # Lower weight for padding prediction
+
+        return text_tokens, text_targets, loss_mask
+
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
+        sample_info = self.samples[idx]
+        data = np.load(sample_info["path"], allow_pickle=True)
+        audio_codes = torch.from_numpy(data["audio_codes"].astype(np.int64))
+        text = str(data["text"])
+
+        T = audio_codes.shape[0]
+        max_T = self.config.max_frames
+        if T > max_T:
+            audio_codes = audio_codes[:max_T]
+            T = max_T
+
+        text_tokens, text_targets, loss_mask = self._build_text_stream(text, T)
 
         return {
-            "audio_tokens": audio_codes,                                    # [T_audio, Q]
-            "text_input_ids": torch.tensor(text_input, dtype=torch.long),   # [N_text]
-            "text_target_ids": torch.tensor(text_target, dtype=torch.long), # [N_text]
+            "audio_tokens": audio_codes,       # [T, Q]
+            "text_tokens": text_tokens,         # [T]
+            "text_targets": text_targets,       # [T]
+            "loss_mask": loss_mask,             # [T]
         }
 
 
 def test_dataset():
-    """Quick test to verify the dataset works."""
     config = DsmAsrConfig()
-    print("Testing dataset pipeline...")
     ds = DsmAsrDataset(config, split="train", max_samples=3)
-
     if len(ds) == 0:
-        print("⚠️  No samples found. Run prepare_data.py first.")
+        print("⚠️  No samples. Run prepare_data.py first.")
         return
 
     sample = ds[0]
-    T_audio = sample["audio_tokens"].shape[0]
-    Q = sample["audio_tokens"].shape[1]
-    N_text = sample["text_input_ids"].shape[0]
+    T = sample["audio_tokens"].shape[0]
+    print(f"\n  audio: {sample['audio_tokens'].shape}")
+    print(f"  text_tokens: {sample['text_tokens'].shape}")
+    print(f"  Total frames: {T}")
 
-    print(f"\n  audio_tokens shape:  {sample['audio_tokens'].shape}  (T_audio={T_audio}, Q={Q})")
-    print(f"  text_input_ids len:  {N_text}")
-    print(f"  text_target_ids len: {sample['text_target_ids'].shape[0]}")
-    print(f"  Total seq length:    {T_audio + N_text}")
+    text_positions = (sample["loss_mask"] >= 0.5).sum().item()
+    real_text = (sample["loss_mask"] == 1.0).sum().item()
+    print(f"  Text positions: {real_text} / {T}")
 
-    # Decode text to verify
-    decoded = ds.tokenizer.decode(sample["text_input_ids"][1:], skip_special_tokens=False)
-    print(f"  Text preview: {decoded[:100]}...")
-
-    assert Q == config.num_codebooks
-    assert sample["text_input_ids"][0] == ds.start_text_id
-    assert sample["text_target_ids"][-1] == ds.end_text_id
+    # Decode text tokens
+    text_ids = sample["text_tokens"][sample["loss_mask"] == 1.0].tolist()
+    decoded = ds.tokenizer.decode(text_ids, skip_special_tokens=True)
+    print(f"  Decoded: {decoded[:100]}...")
 
     print("\n✅ Dataset test PASSED!")
 

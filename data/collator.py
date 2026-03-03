@@ -1,12 +1,8 @@
 """
-DSM-ASR Data Collator (Audio Prefix → Text Generation)
+DSM-ASR Collator v3 — Parallel Streams
 
-Builds the full training sequence by concatenating audio embeddings + text tokens.
-Handles padding across variable-length samples in a batch.
-
-Sequence layout per sample:
-    [AUDIO_1, ..., AUDIO_T, START_TEXT, text_1, ..., text_N] ← input
-    [-100,    ..., -100,    text_1,     ...,    text_N, END]  ← target (loss only on text)
+Pads variable-length samples to the same T (num frames).
+Both audio_tokens and text_tokens are padded to max T in the batch.
 """
 import torch
 from typing import Dict, List
@@ -19,60 +15,32 @@ from config import DsmAsrConfig
 
 @dataclass
 class DsmAsrCollator:
-    """
-    Collates variable-length audio+text samples into padded batches.
-    
-    Returns a batch dict with:
-    - audio_tokens:    [B, T_audio_max, Q]  padded audio codebook indices
-    - text_input_ids:  [B, N_text_max]      padded text input token IDs
-    - text_target_ids: [B, N_text_max]      padded text target token IDs (-100 for pad)
-    - audio_lengths:   [B]                  actual audio lengths per sample
-    - text_lengths:    [B]                  actual text lengths per sample
-    """
     config: DsmAsrConfig
-    text_pad_token_id: int  # Usually 0 or tokenizer.pad_token_id
+    pad_text_id: int  # PAD token ID for text stream
 
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        batch_size = len(batch)
+        B = len(batch)
         Q = self.config.num_codebooks
+        max_T = max(s["audio_tokens"].shape[0] for s in batch)
 
-        # Get max lengths
-        max_audio_len = max(s["audio_tokens"].shape[0] for s in batch)
-        max_text_len = max(s["text_input_ids"].shape[0] for s in batch)
+        audio_tokens = torch.full((B, max_T, Q), self.config.audio_pad_token, dtype=torch.long)
+        text_tokens = torch.full((B, max_T), self.pad_text_id, dtype=torch.long)
+        text_targets = torch.full((B, max_T), -100, dtype=torch.long)
+        loss_mask = torch.zeros(B, max_T, dtype=torch.float32)
+        lengths = torch.zeros(B, dtype=torch.long)
 
-        # Pre-allocate padded tensors
-        audio_tokens = torch.full(
-            (batch_size, max_audio_len, Q),
-            self.config.audio_pad_token,
-            dtype=torch.long,
-        )
-        text_input_ids = torch.full(
-            (batch_size, max_text_len),
-            self.text_pad_token_id,
-            dtype=torch.long,
-        )
-        text_target_ids = torch.full(
-            (batch_size, max_text_len),
-            -100,  # Ignored by cross-entropy
-            dtype=torch.long,
-        )
-        audio_lengths = torch.zeros(batch_size, dtype=torch.long)
-        text_lengths = torch.zeros(batch_size, dtype=torch.long)
-
-        for i, sample in enumerate(batch):
-            T_a = sample["audio_tokens"].shape[0]
-            T_t = sample["text_input_ids"].shape[0]
-
-            audio_tokens[i, :T_a] = sample["audio_tokens"]
-            text_input_ids[i, :T_t] = sample["text_input_ids"]
-            text_target_ids[i, :T_t] = sample["text_target_ids"]
-            audio_lengths[i] = T_a
-            text_lengths[i] = T_t
+        for i, s in enumerate(batch):
+            T = s["audio_tokens"].shape[0]
+            audio_tokens[i, :T] = s["audio_tokens"]
+            text_tokens[i, :T] = s["text_tokens"]
+            text_targets[i, :T] = s["text_targets"]
+            loss_mask[i, :T] = s["loss_mask"]
+            lengths[i] = T
 
         return {
-            "audio_tokens": audio_tokens,        # [B, T_audio, Q]
-            "text_input_ids": text_input_ids,     # [B, N_text]
-            "text_target_ids": text_target_ids,   # [B, N_text]  (-100 for padding)
-            "audio_lengths": audio_lengths,       # [B]
-            "text_lengths": text_lengths,          # [B]
+            "audio_tokens": audio_tokens,  # [B, T, Q]
+            "text_tokens": text_tokens,    # [B, T]
+            "text_targets": text_targets,  # [B, T]
+            "loss_mask": loss_mask,        # [B, T]
+            "lengths": lengths,            # [B]
         }
