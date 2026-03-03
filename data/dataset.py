@@ -70,25 +70,39 @@ class DsmAsrDataset(Dataset):
         info = self.samples[idx]
         data = np.load(info["path"], allow_pickle=True)
 
-        # Shift raw flat ids (0..16383) into vocabulary range
+        # ── Audio tokens ───────────────────────────────────────────
+        # raw_flat: 1D int array of values 0..16383 (T*Q total)
+        raw_flat = data["audio_flat"].astype(np.int64)
+
+        # Truncate to max allowed frames (whole-frame boundary)
+        max_audio_toks = self.config.max_frames * self.config.num_codebooks
+        if len(raw_flat) > max_audio_toks:
+            raw_flat = raw_flat[:max_audio_toks]
+
+        # Shift into the vocabulary range: 0..16383 → offset..offset+16383
         audio_vocab_ids = raw_flat + self.config.audio_token_offset
 
-        # Safety check — catch OOB on CPU before it reaches the GPU
-        max_id = audio_vocab_ids.max() if len(audio_vocab_ids) > 0 else 0
-        expected_max = self.config.total_vocab_size - 1
-        assert max_id <= expected_max, (
-            f"Audio token ID {max_id} exceeds vocab size {self.config.total_vocab_size}. "
-            f"Check config: offset={self.config.audio_token_offset}, "
-            f"audio_vocab={self.config.audio_vocab_size}")
+        # CPU-side bounds check — much better error than a CUDA assert
+        if len(audio_vocab_ids) > 0:
+            hi = int(audio_vocab_ids.max())
+            lo = int(audio_vocab_ids.min())
+            assert hi < self.config.total_vocab_size, (
+                f"[dataset] Audio token {hi} >= vocab_size {self.config.total_vocab_size}. "
+                f"offset={self.config.audio_token_offset}, "
+                f"audio_vocab={self.config.audio_vocab_size}. "
+                f"Re-run with CUDA_LAUNCH_BLOCKING=1 if this persists.")
+            assert lo >= self.config.audio_token_offset, (
+                f"[dataset] Audio token {lo} < offset {self.config.audio_token_offset}. "
+                f"Raw flat value was negative — check prepare_data.py.")
 
-        # Tokenize text
+        # ── Text tokens ────────────────────────────────────────────
         text = str(data["text"]).strip()
         text_ids = self.tokenizer.encode(text, add_special_tokens=False)
         if len(text_ids) > self.config.max_text_tokens:
             text_ids = text_ids[:self.config.max_text_tokens]
 
-        # Build full sequence:
-        #   [audio_start, *audio_vocab_ids, audio_end, text_start, *text_ids, text_end]
+        # ── Build sequence ─────────────────────────────────────────
+        # [audio_start | audio_vocab_ids | audio_end | text_start | text_ids | text_end]
         input_ids = (
             [self.audio_start] +
             audio_vocab_ids.tolist() +
@@ -97,17 +111,19 @@ class DsmAsrDataset(Dataset):
             [self.text_end]
         )
 
-        # Labels: -100 for everything except text_ids and text_end
-        #   Position of text tokens = 1 + len(audio) + 2 for audio_end, text_start
-        audio_block_len = 1 + len(audio_vocab_ids) + 2  # audio_start + audio + audio_end + text_start
+        # Labels: -100 everywhere except text tokens (loss on text only)
+        # audio_block_len = audio_start(1) + audio_ids(T*Q) + audio_end(1) + text_start(1)
+        audio_block_len = 1 + len(audio_vocab_ids) + 1 + 1
         labels = [-100] * audio_block_len + text_ids + [self.text_end]
 
-        assert len(input_ids) == len(labels), f"{len(input_ids)} != {len(labels)}"
+        assert len(input_ids) == len(labels), (
+            f"Sequence length mismatch: input={len(input_ids)} labels={len(labels)}")
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels":    torch.tensor(labels,    dtype=torch.long),
         }
+
 
 
 if __name__ == "__main__":
