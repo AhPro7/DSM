@@ -1,13 +1,10 @@
 """
-DSM-ASR Training v4 — Instruction Fine-Tuning
+DSM-ASR Training v5 — SODA-Style Interleaved Tokens
 
-Features:
-- Prints sample predictions with WER during training
-- KV-cache inference for fast generation
-- Instruction format: audio prefix → text generation
+Standard causal LM training on interleaved audio-text sequences.
+Prints sample predictions with full prompt + WER during training.
 """
 import os, sys, time, json, re, argparse
-import numpy as np
 from pathlib import Path
 
 import torch
@@ -27,28 +24,47 @@ from model.dsm_asr import DsmAsrModel
 def normalize_ar(text):
     text = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670]').sub('', text)
     text = re.sub(r'[إأآا]', 'ا', text)
-    text = text.replace('ة', 'ه').replace('ـ', '')
-    return ' '.join(text.split()).strip()
+    return ' '.join(text.replace('ة', 'ه').replace('ـ', '').split()).strip()
 
 
-def print_predictions(model, eval_ds, tokenizer, device, config, n=5):
-    """Print sample predictions during training."""
+def print_predictions(model, eval_ds, tokenizer, config, device, n=5):
+    """Print sample predictions with full prompt shown."""
     model.eval()
     wers = []
     print(f"\n{'='*70}")
     print(f"📋 Sample Predictions")
+    print(f"{'═'*70}")
+    print(f"  PROMPT FORMAT: {config.audio_start_token} [audio_tokens x T×Q] "
+          f"{config.audio_end_token} {config.text_start_token}")
+    print(f"  MODEL PREDICTS → [transcription] {config.text_end_token}")
     print(f"{'='*70}")
-    
-    # Instruction and Separator from config
-    instr_text = config.instruction
-    sep_text = config.separator
 
     for i in range(min(n, len(eval_ds))):
         s = eval_ds[i]
-        audio = s["audio_tokens"].unsqueeze(0).to(device)
-        ref = tokenizer.decode(s["target_ids"], skip_special_tokens=True).strip()
+        input_ids = s["input_ids"]
+        labels = s["labels"]
 
-        pred = model.generate(audio, tokenizer)
+        # Extract audio token IDs from sequence
+        # Sequence: [audio_start, *audio_ids, audio_end, text_start, *text_ids, text_end]
+        audio_start_id = tokenizer.convert_tokens_to_ids(config.audio_start_token)
+        audio_end_id   = tokenizer.convert_tokens_to_ids(config.audio_end_token)
+        
+        ids_list = input_ids.tolist()
+        try:
+            a_start = ids_list.index(audio_start_id) + 1
+            a_end   = ids_list.index(audio_end_id)
+            audio_flat_ids = input_ids[a_start:a_end]
+        except ValueError:
+            continue
+
+        ref_ids = labels[labels != -100].tolist()
+        ref = tokenizer.decode(ref_ids, skip_special_tokens=True).strip()
+
+        num_audio_toks = len(audio_flat_ids)
+        num_frames = num_audio_toks // config.num_codebooks
+
+        with torch.no_grad():
+            pred = model.generate(audio_flat_ids.to(device), tokenizer)
 
         try:
             from jiwer import wer as calc_wer
@@ -57,8 +73,9 @@ def print_predictions(model, eval_ds, tokenizer, device, config, n=5):
             w = -1.0
         wers.append(w)
 
-        print(f"\n  [{i+1}] WER={w:.2f}")
-        print(f"       PROMPT: {instr_text.strip()} [AUDIO] {sep_text.strip()}")
+        print(f"\n  [{i+1}] WER={w:.2f}  Audio={num_frames} frames ({num_audio_toks} tokens)")
+        print(f"       PROMPT: {config.audio_start_token} [...{num_audio_toks} audio tokens...] "
+              f"{config.audio_end_token} {config.text_start_token}")
         print(f"       REF:    {ref[:80]}")
         print(f"       HYP:    {pred[:80]}")
 
@@ -77,15 +94,8 @@ def evaluate_loss(model, loader, device, max_batches=50):
         for i, b in enumerate(loader):
             if i >= max_batches:
                 break
-            out = model(
-                b["instruction_ids"].to(device),
-                b["audio_tokens"].to(device),
-                b["separator_ids"].to(device),
-                b["target_ids"].to(device),
-                b["labels"].to(device),
-                b["audio_lengths"].to(device),
-                b["target_lengths"].to(device),
-            )
+            out = model(b["input_ids"].to(device), b["labels"].to(device),
+                        b["attention_mask"].to(device))
             n = (b["labels"] != -100).sum().item()
             total += out.loss.item() * n
             count += n
@@ -95,46 +105,47 @@ def evaluate_loss(model, loader, device, max_batches=50):
 
 def train(config, args):
     print("=" * 60)
-    print("DSM-ASR Training v4 — Instruction Fine-Tuning")
+    print("DSM-ASR Training v5 — SODA Interleaved Format")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Resume logic
-    start_epoch = 0
-    global_step = 0
-    
+    # Build or load tokenizer
     if args.resume_from:
         print(f"🔄 Resuming from: {args.resume_from}")
         model, tokenizer, config = load_checkpoint(args.resume_from, device)
-        # Attempt to extract step/epoch if possible
-        # For simplicity, we just load weights
+        model = model.to(device)
     else:
         tokenizer = AutoTokenizer.from_pretrained(config.qwen_model, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": config.special_tokens})
         model = DsmAsrModel(config, tokenizer=tokenizer).to(device)
 
-    train_ds = DsmAsrDataset(config, "train", tokenizer=tokenizer, max_samples=args.max_samples)
-    eval_ds = DsmAsrDataset(config, "eval", tokenizer=tokenizer, max_samples=args.max_samples)
-    collator = DsmAsrCollator(config=config, text_pad_id=tokenizer.pad_token_id)
+    print(f"\n📐 Vocab size: {len(tokenizer):,}")
+    print(f"   Audio start: {tokenizer.convert_tokens_to_ids(config.audio_start_token)}")
+    print(f"   Audio offset: {config.audio_token_offset}")
+    print(f"   Total audio tokens: {config.audio_vocab_size:,} (={config.num_codebooks}cb×{config.audio_codebook_size})")
+    print(f"\n   PROMPT: {config.audio_start_token} [audio] {config.audio_end_token} {config.text_start_token}")
+    print(f"   MODEL PREDICTS: [transcription] {config.text_end_token}")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=config.batch_size, shuffle=True,
-        num_workers=2, collate_fn=collator, pin_memory=True, drop_last=True)
-    eval_loader = DataLoader(
-        eval_ds, batch_size=config.batch_size, shuffle=False,
-        num_workers=2, collate_fn=collator, pin_memory=True)
+    train_ds = DsmAsrDataset(config, "train", tokenizer=tokenizer,
+                              max_samples=args.max_samples)
+    eval_ds  = DsmAsrDataset(config, "eval",  tokenizer=tokenizer,
+                              max_samples=args.max_samples)
+    collator = DsmAsrCollator(pad_token_id=tokenizer.pad_token_id)
 
-    # Optimizer: audio params get higher LR
-    audio_params = (list(model.audio_embeddings.parameters()) +
-                    list(model.audio_adapter.parameters()) + [model.audio_scale])
-    backbone_params = list(model.backbone.parameters())
-    optimizer = torch.optim.AdamW([
-        {"params": audio_params, "lr": config.learning_rate * config.audio_lr_multiplier},
-        {"params": backbone_params, "lr": config.learning_rate},
-    ], weight_decay=config.weight_decay)
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
+                               num_workers=2, collate_fn=collator, pin_memory=True,
+                               drop_last=True)
+    eval_loader  = DataLoader(eval_ds,  batch_size=config.batch_size, shuffle=False,
+                               num_workers=2, collate_fn=collator, pin_memory=True)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate,
+        weight_decay=config.weight_decay)
 
     steps_per_epoch = max(1, len(train_loader) // config.gradient_accumulation_steps)
     total_steps = steps_per_epoch * config.num_epochs
@@ -150,38 +161,28 @@ def train(config, args):
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n🚀 Train: {config.num_epochs} epochs, {total_steps} steps")
-    print(f"   Batch: {config.batch_size}×{config.gradient_accumulation_steps}")
-    print(f"   Instruction: \"{config.instruction.strip()}\"")
-    print(f"   Separator: \"{config.separator.strip()}\"")
+    print(f"\n🚀 Training: {config.num_epochs} epochs, {total_steps} steps")
+    print(f"   Batch: {config.batch_size}×{config.gradient_accumulation_steps} "
+          f"= {config.batch_size * config.gradient_accumulation_steps} effective\n")
 
-    best_loss = float("inf")
+    global_step, best_loss = 0, float("inf")
     log = []
 
-    for epoch in range(start_epoch, config.num_epochs):
-        model.unfreeze_backbone()
+    for epoch in range(config.num_epochs):
+        model.unfreeze_all()
         model.train()
-
-        print(f"\n📌 Epoch {epoch+1}/{config.num_epochs}  "
-              f"Trainable: {model.get_trainable_params():,}")
-
         epoch_loss, epoch_n = 0.0, 0
         optimizer.zero_grad()
 
+        print(f"📌 Epoch {epoch+1}/{config.num_epochs}  "
+              f"Trainable: {model.get_trainable_params():,}")
+
         pbar = tqdm(enumerate(train_loader), total=len(train_loader),
                     desc=f"Epoch {epoch+1}")
-
         for batch_idx, b in pbar:
             with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                out = model(
-                    b["instruction_ids"].to(device),
-                    b["audio_tokens"].to(device),
-                    b["separator_ids"].to(device),
-                    b["target_ids"].to(device),
-                    b["labels"].to(device),
-                    b["audio_lengths"].to(device),
-                    b["target_lengths"].to(device),
-                )
+                out = model(b["input_ids"].to(device), b["labels"].to(device),
+                            b["attention_mask"].to(device))
                 loss = out.loss / config.gradient_accumulation_steps
 
             if config.fp16:
@@ -207,24 +208,23 @@ def train(config, args):
                 global_step += 1
 
                 avg = epoch_loss / max(epoch_n, 1)
-                lr = scheduler.get_last_lr()[0]
+                lr  = scheduler.get_last_lr()[0]
                 pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{lr:.2e}", step=global_step)
 
                 if global_step % config.log_every_n_steps == 0:
                     log.append({"step": global_step, "loss": avg, "lr": lr})
 
-                # Print sample predictions
                 if global_step % config.print_samples_every == 0 and len(eval_ds) > 0:
-                    print_predictions(model, eval_ds, tokenizer, device, config,
+                    print_predictions(model, eval_ds, tokenizer, config, device,
                                       n=config.num_print_samples)
 
-                # Eval
                 if global_step % config.eval_every_n_steps == 0 and len(eval_ds) > 0:
                     el = evaluate_loss(model, eval_loader, device)
                     print(f"\n🔍 Step {global_step}: eval_loss={el:.4f}")
                     if el < best_loss:
                         best_loss = el
-                        save_ckpt(model, tokenizer, config, output_dir / "best", global_step)
+                        save_ckpt(model, tokenizer, config,
+                                  output_dir / "best", global_step)
                         print(f"   💾 Best! ({best_loss:.4f})")
 
                 if global_step % config.save_every_n_steps == 0:
@@ -235,21 +235,17 @@ def train(config, args):
                     break
 
         avg_epoch = epoch_loss / max(epoch_n, 1)
-        print(f"\n📊 Epoch {epoch+1}: loss={avg_epoch:.4f}")
-        save_ckpt(model, tokenizer, config, output_dir / f"epoch-{epoch+1}", global_step)
-
-        # Predictions at epoch end
+        print(f"\n📊 Epoch {epoch+1} done: loss={avg_epoch:.4f}")
+        save_ckpt(model, tokenizer, config,
+                  output_dir / f"epoch-{epoch+1}", global_step)
         if len(eval_ds) > 0:
-            print_predictions(model, eval_ds, tokenizer, device, config, n=config.num_print_samples)
+            print_predictions(model, eval_ds, tokenizer, config, device,
+                              n=config.num_print_samples)
 
         if args.max_steps and global_step >= args.max_steps:
             break
 
-    # Final
-    if len(eval_ds) > 0:
-        el = evaluate_loss(model, eval_loader, device)
-        if el < best_loss:
-            best_loss = el
+    # Final save
     if not (output_dir / "best" / "model.pt").exists():
         save_ckpt(model, tokenizer, config, output_dir / "best", global_step)
     save_ckpt(model, tokenizer, config, output_dir / "final", global_step)
@@ -261,7 +257,8 @@ def train(config, args):
 def save_ckpt(model, tokenizer, config, path, step):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": model.state_dict(), "step": step}, path / "model.pt")
+    torch.save({"model_state_dict": model.state_dict(), "step": step},
+               path / "model.pt")
     tokenizer.save_pretrained(path / "tokenizer")
     with open(path / "config.json", "w") as f:
         json.dump(vars(config), f, indent=2, default=str)
@@ -273,7 +270,8 @@ def load_checkpoint(ckpt_dir, device="cuda"):
         d = json.load(f)
     config = DsmAsrConfig(**{k: v for k, v in d.items()
                              if k in DsmAsrConfig.__dataclass_fields__})
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir / "tokenizer", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        ckpt_dir / "tokenizer", trust_remote_code=True)
     model = DsmAsrModel(config, tokenizer=tokenizer)
     ckpt = torch.load(ckpt_dir / "model.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -287,16 +285,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--use_wandb", action="store_true")
     args = parser.parse_args()
 
     config = DsmAsrConfig()
-    if args.batch_size: config.batch_size = args.batch_size
-    if args.num_epochs: config.num_epochs = args.num_epochs
+    if args.batch_size:    config.batch_size = args.batch_size
+    if args.num_epochs:    config.num_epochs = args.num_epochs
     if args.learning_rate: config.learning_rate = args.learning_rate
-    if args.output_dir: config.output_dir = args.output_dir
-    if args.use_wandb: config.use_wandb = True
+    if args.output_dir:    config.output_dir = args.output_dir
+    if args.use_wandb:     config.use_wandb = True
 
     train(config, args)

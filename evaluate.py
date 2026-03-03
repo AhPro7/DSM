@@ -1,6 +1,6 @@
-"""DSM-ASR Evaluation v4"""
-import os, sys, json, argparse, time, re
-import torch, numpy as np
+"""DSM-ASR Evaluation v5 — SODA-Style"""
+import os, sys, json, argparse, re, time
+import torch
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,7 +12,7 @@ from train import load_checkpoint
 def normalize_ar(t):
     t = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670]').sub('', t)
     t = re.sub(r'[إأآا]', 'ا', t)
-    return ' '.join(t.replace('ة','ه').replace('ـ','').split()).strip()
+    return ' '.join(t.replace('ة', 'ه').replace('ـ', '').split()).strip()
 
 
 def evaluate_model(model, tokenizer, config, max_samples=None, device="cuda"):
@@ -21,35 +21,49 @@ def evaluate_model(model, tokenizer, config, max_samples=None, device="cuda"):
     preds, refs, dts, durs = [], [], [], []
     model.eval()
 
+    audio_start_id = tokenizer.convert_tokens_to_ids(config.audio_start_token)
+    audio_end_id   = tokenizer.convert_tokens_to_ids(config.audio_end_token)
+
     for i in tqdm(range(len(ds)), desc="Evaluating"):
         s = ds[i]
-        audio = s["audio_tokens"].unsqueeze(0).to(device)
-        ref = tokenizer.decode(s["target_ids"], skip_special_tokens=True).strip()
+        ids_list = s["input_ids"].tolist()
+        labels   = s["labels"]
 
+        # Extract audio flat IDs from sequence
+        try:
+            a_start = ids_list.index(audio_start_id) + 1
+            a_end   = ids_list.index(audio_end_id)
+            audio_flat = s["input_ids"][a_start:a_end]
+        except ValueError:
+            continue
+
+        ref = tokenizer.decode(labels[labels != -100].tolist(),
+                               skip_special_tokens=True).strip()
         t0 = time.time()
         with torch.no_grad():
-            pred = model.generate(audio, tokenizer)
+            pred = model.generate(audio_flat.to(device), tokenizer)
         dt = time.time() - t0
 
         preds.append(normalize_ar(pred))
         refs.append(normalize_ar(ref))
-        durs.append(ds.samples[i].get("duration", audio.shape[1] / config.frame_rate))
+        durs.append(ds.samples[i].get("duration", len(audio_flat) / config.frame_rate))
         dts.append(dt)
 
     valid = [(p, r) for p, r in zip(preds, refs) if p and r]
     if not valid:
-        return {"wer": -1, "cer": -1}
+        return {"wer": -1, "cer": -1, "num_valid": 0}
     ps, rs = zip(*valid)
-    per = [{"prediction": p, "reference": r,
-            "wer": round(wer([r],[p]),4), "cer": round(cer([r],[p]),4)}
-           for p, r in zip(ps, rs)]
+    per_sample = [
+        {"prediction": p, "reference": r,
+         "wer": round(wer([r], [p]), 4), "cer": round(cer([r], [p]), 4)}
+        for p, r in zip(ps, rs)
+    ]
     return {
         "wer": round(wer(list(rs), list(ps)), 4),
         "cer": round(cer(list(rs), list(ps)), 4),
         "num_valid": len(valid),
-        "avg_rtf": round(sum(dts)/max(sum(durs),0.001), 4),
-        "total_audio_seconds": round(sum(durs), 2),
-        "per_sample": per,
+        "avg_rtf": round(sum(dts) / max(sum(durs), 0.001), 4),
+        "per_sample": per_sample,
     }
 
 

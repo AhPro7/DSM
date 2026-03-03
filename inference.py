@@ -1,33 +1,35 @@
-"""DSM-ASR Inference v4"""
+"""DSM-ASR Inference v5 — SODA-Style"""
 import os, sys, time, argparse
-import torch, librosa
+import torch, librosa, numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DsmAsrConfig
 from train import load_checkpoint
+from data.prepare_data import mimi_codes_to_flat_tokens
 
 
-def encode_audio(path, sr=24000, num_codebooks=8, device="cuda"):
+def encode_audio(audio_path, config: DsmAsrConfig, device="cuda"):
     from transformers import MimiModel, AutoFeatureExtractor
-    audio, _ = librosa.load(path, sr=sr, mono=True)
-    mimi = MimiModel.from_pretrained("kyutai/mimi").to(device).eval()
-    fe = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
-    inp = fe(raw_audio=audio, sampling_rate=sr, return_tensors="pt")
+    audio, _ = librosa.load(audio_path, sr=config.sample_rate, mono=True)
+    mimi = MimiModel.from_pretrained(config.mimi_model).to(device).eval()
+    fe   = AutoFeatureExtractor.from_pretrained(config.mimi_model)
+    inp  = fe(raw_audio=audio, sampling_rate=config.sample_rate, return_tensors="pt")
     with torch.no_grad():
         codes = mimi.encode(inp["input_values"].to(device)).audio_codes
         if codes.dim() == 4:
-            codes = codes[0, 0, :num_codebooks, :].T
+            codes = codes[0, 0, :config.num_codebooks, :].T   # [T, Q]
         else:
-            codes = codes[0, :num_codebooks, :].T
-    return codes, len(audio) / sr
+            codes = codes[0, :config.num_codebooks, :].T
+    flat = mimi_codes_to_flat_tokens(codes.cpu().numpy(), config)
+    flat_vocab = torch.tensor(flat + config.audio_token_offset, dtype=torch.long)
+    return flat_vocab, len(audio) / config.sample_rate
 
 
 def transcribe(model, tokenizer, config, audio_path, temperature=0.0, device="cuda"):
     model.eval()
-    codes, dur = encode_audio(audio_path, config.sample_rate, config.num_codebooks, device)
-    audio = codes.unsqueeze(0).to(device)
+    flat_vocab, dur = encode_audio(audio_path, config, device)
     t0 = time.time()
-    text = model.generate(audio, tokenizer, temperature=temperature)
+    text = model.generate(flat_vocab.to(device), tokenizer, temperature=temperature)
     dt = time.time() - t0
     return {"text": text, "duration": dur, "decode_time": dt,
             "rtf": dt / max(dur, 0.001)}
@@ -43,4 +45,4 @@ if __name__ == "__main__":
     model, tok, config = load_checkpoint(args.checkpoint, device)
     r = transcribe(model, tok, config, args.audio, args.temperature, device)
     print(f"\n📝 {r['text']}")
-    print(f"📊 {r['duration']:.1f}s, RTF={r['rtf']:.3f}")
+    print(f"📊 {r['duration']:.1f}s audio, RTF={r['rtf']:.3f}")

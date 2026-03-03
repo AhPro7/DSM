@@ -1,34 +1,47 @@
 """
-DSM-ASR Configuration v4 — Instruction Fine-Tuning
+DSM-ASR Configuration v5 — SODA-Style Interleaved Tokens
 
-Architecture:
-    [instruction] [audio_emb_1...audio_emb_T] [sep] [transcription] [EOS]
-    |<------------ no loss ----------------->|      |<-- loss here ->|
+Architecture from SODA paper (soda-audio.github.io):
+  Audio tokens are added directly to the LM vocabulary.
+  No separate embedding tables, no adapters.
+  Training = standard next-token prediction on interleaved sequences.
+
+Sequence format:
+  <|audio_start|> [audio_tok_0..tok_T*Q-1] <|audio_end|> <|text_start|> [text] <|text_end|>
+
+Token mapping (per frame f, codebook q, value v):
+  flat_id  = q * audio_codebook_size + v          (0..16383)
+  vocab_id = flat_id + text_vocab_size + num_special_tokens
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
 @dataclass
 class DsmAsrConfig:
-    # ── Models ───────────────────────────────────────────────────────
+    # ── Backbone ──────────────────────────────────────────────────────
     qwen_model: str = "Qwen/Qwen3-0.6B-Base"
     mimi_model: str = "kyutai/mimi"
 
-    # ── Audio (Mimi) ─────────────────────────────────────────────────
+    # ── Mimi audio codec ─────────────────────────────────────────────
     sample_rate: int = 24_000
-    frame_rate: float = 12.5
+    frame_rate: float = 12.5          # frames/sec
     num_codebooks: int = 8
-    audio_vocab_size: int = 2048
-    audio_pad_token: int = 2048
+    audio_codebook_size: int = 2048   # each codebook: 0..2047
 
-    # ── Audio Adapter ────────────────────────────────────────────────
-    audio_adapter_layers: int = 2
-    audio_adapter_dropout: float = 0.1
+    # ── Vocabulary ───────────────────────────────────────────────────
+    # Qwen3-0.6B text vocab size (before adding audio tokens)
+    text_vocab_size: int = 151_671
+    # 4 special tokens added BEFORE audio token range
+    num_extra_special: int = 4
+    # audio vocab = num_codebooks * audio_codebook_size = 16384
+    # total = 151671 + 4 + 16384 = 168059
 
-    # ── Instruction / Prompt ─────────────────────────────────────────
-    instruction: str = "Transcribe the following audio:\n"#+ audio tokens + separator + transcription + EOS
-    separator: str = "\nTranscription: "
+    # Special token strings
+    audio_start_token: str = "<|audio_start|>"
+    audio_end_token:   str = "<|audio_end|>"
+    text_start_token:  str = "<|text_start|>"
+    text_end_token:    str = "<|text_end|>"
 
     # ── Sequence limits ──────────────────────────────────────────────
     max_audio_duration: float = 30.0
@@ -36,7 +49,6 @@ class DsmAsrConfig:
 
     # ── Training ─────────────────────────────────────────────────────
     learning_rate: float = 2e-4
-    audio_lr_multiplier: float = 5.0
     weight_decay: float = 0.01
     batch_size: int = 4
     gradient_accumulation_steps: int = 8
@@ -54,13 +66,12 @@ class DsmAsrConfig:
     train_split: str = "train"
     eval_split: Optional[str] = None
     eval_ratio: float = 0.05
-    preprocessing_num_workers: int = 4
 
     # ── Paths ────────────────────────────────────────────────────────
     output_dir: str = "./output"
     preprocessed_dir: str = "./preprocessed_data"
 
-    # ── Logging ──────────────────────────────────────────────────────
+    # ── Logging / Monitoring ─────────────────────────────────────────
     use_wandb: bool = False
     wandb_project: str = "dsm-asr"
     log_every_n_steps: int = 10
@@ -69,10 +80,30 @@ class DsmAsrConfig:
     print_samples_every: int = 50
     num_print_samples: int = 5
 
+    # ── Derived (read-only) ──────────────────────────────────────────
     @property
-    def max_frames(self) -> int:
-        return int(self.max_audio_duration * self.frame_rate)
+    def audio_vocab_size(self) -> int:
+        return self.num_codebooks * self.audio_codebook_size  # 16384
 
     @property
-    def model_dim(self) -> int:
-        return 1024
+    def total_vocab_size(self) -> int:
+        return self.text_vocab_size + self.num_extra_special + self.audio_vocab_size
+
+    @property
+    def audio_token_offset(self) -> int:
+        """First audio vocab_id in the combined vocabulary."""
+        return self.text_vocab_size + self.num_extra_special
+
+    @property
+    def max_frames(self) -> int:
+        return int(self.max_audio_duration * self.frame_rate)  # 375
+
+    def flat_audio_id(self, codebook: int, code_value: int) -> int:
+        """Map (codebook, code_value) → vocab token id."""
+        flat = codebook * self.audio_codebook_size + code_value
+        return flat + self.audio_token_offset
+
+    @property
+    def special_tokens(self):
+        return [self.audio_start_token, self.audio_end_token,
+                self.text_start_token, self.text_end_token]
