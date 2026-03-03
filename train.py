@@ -31,13 +31,17 @@ def normalize_ar(text):
     return ' '.join(text.split()).strip()
 
 
-def print_predictions(model, eval_ds, tokenizer, device, n=5):
+def print_predictions(model, eval_ds, tokenizer, device, config, n=5):
     """Print sample predictions during training."""
     model.eval()
     wers = []
     print(f"\n{'='*70}")
     print(f"📋 Sample Predictions")
     print(f"{'='*70}")
+    
+    # Instruction and Separator from config
+    instr_text = config.instruction
+    sep_text = config.separator
 
     for i in range(min(n, len(eval_ds))):
         s = eval_ds[i]
@@ -54,8 +58,9 @@ def print_predictions(model, eval_ds, tokenizer, device, n=5):
         wers.append(w)
 
         print(f"\n  [{i+1}] WER={w:.2f}")
-        print(f"       REF: {ref[:80]}")
-        print(f"       HYP: {pred[:80]}")
+        print(f"       PROMPT: {instr_text.strip()} [AUDIO] {sep_text.strip()}")
+        print(f"       REF:    {ref[:80]}")
+        print(f"       HYP:    {pred[:80]}")
 
     valid = [w for w in wers if w >= 0]
     avg = sum(valid) / max(len(valid), 1)
@@ -96,9 +101,20 @@ def train(config, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(config.qwen_model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Resume logic
+    start_epoch = 0
+    global_step = 0
+    
+    if args.resume_from:
+        print(f"🔄 Resuming from: {args.resume_from}")
+        model, tokenizer, config = load_checkpoint(args.resume_from, device)
+        # Attempt to extract step/epoch if possible
+        # For simplicity, we just load weights
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(config.qwen_model, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = DsmAsrModel(config, tokenizer=tokenizer).to(device)
 
     train_ds = DsmAsrDataset(config, "train", tokenizer=tokenizer, max_samples=args.max_samples)
     eval_ds = DsmAsrDataset(config, "eval", tokenizer=tokenizer, max_samples=args.max_samples)
@@ -110,8 +126,6 @@ def train(config, args):
     eval_loader = DataLoader(
         eval_ds, batch_size=config.batch_size, shuffle=False,
         num_workers=2, collate_fn=collator, pin_memory=True)
-
-    model = DsmAsrModel(config, tokenizer=tokenizer).to(device)
 
     # Optimizer: audio params get higher LR
     audio_params = (list(model.audio_embeddings.parameters()) +
@@ -141,11 +155,10 @@ def train(config, args):
     print(f"   Instruction: \"{config.instruction.strip()}\"")
     print(f"   Separator: \"{config.separator.strip()}\"")
 
-    global_step = 0
     best_loss = float("inf")
     log = []
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         model.unfreeze_backbone()
         model.train()
 
@@ -202,7 +215,7 @@ def train(config, args):
 
                 # Print sample predictions
                 if global_step % config.print_samples_every == 0 and len(eval_ds) > 0:
-                    print_predictions(model, eval_ds, tokenizer, device,
+                    print_predictions(model, eval_ds, tokenizer, device, config,
                                       n=config.num_print_samples)
 
                 # Eval
@@ -227,7 +240,7 @@ def train(config, args):
 
         # Predictions at epoch end
         if len(eval_ds) > 0:
-            print_predictions(model, eval_ds, tokenizer, device, n=config.num_print_samples)
+            print_predictions(model, eval_ds, tokenizer, device, config, n=config.num_print_samples)
 
         if args.max_steps and global_step >= args.max_steps:
             break
@@ -275,6 +288,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint directory to resume from")
     parser.add_argument("--use_wandb", action="store_true")
     args = parser.parse_args()
 

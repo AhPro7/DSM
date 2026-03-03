@@ -27,7 +27,7 @@ class DsmAsrConfig:
     audio_adapter_dropout: float = 0.1
 
     # ── Instruction / Prompt ─────────────────────────────────────────
-    instruction: str = "Transcribe the following audio:\n"
+    instruction: str = "Transcribe the following audio:\n"#+ audio tokens + separator + transcription + EOS
     separator: str = "\nTranscription: "
 
     # ── Sequence limits ──────────────────────────────────────────────
