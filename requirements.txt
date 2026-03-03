@@ -7,3 +7,4 @@ librosa
 tqdm
 jiwer
 wandb
+whisper-timestamped

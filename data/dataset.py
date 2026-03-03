@@ -1,20 +1,13 @@
 """
-DSM-ASR Dataset v3 — True Delayed Streams
+DSM-ASR Dataset v3 — With Real Word Timestamps (Moshi Paper)
 
-Based on the Moshi paper:
-Audio and text are PARALLEL streams at 12.5Hz frame rate.
-Text tokens are placed at their positions AFTER a delay of `delay_frames`.
+Uses word-level timestamps from whisper to precisely place text tokens
+at the correct audio frames, matching the paper's approach exactly.
 
-Since we don't have word-level timestamps, we use a simple strategy:
-- Tokenize the full text
-- Spread text tokens evenly across the available frames (after delay)
-- Fill gaps with PAD, insert EPAD before text bursts
+Text stream format:
+    PAD PAD PAD EPAD [word1_tokens] PAD PAD EPAD [word2_tokens] PAD ... EOS
 
-Training format per sample:
-    audio_tokens: [T, Q]  — Mimi codebook indices per frame
-    text_tokens:  [T]     — text stream aligned to audio at frame rate
-    text_targets: [T]     — shifted text_tokens for next-token prediction
-    loss_mask:    [T]     — 1.0 for text positions, 0.0 for PAD positions
+Each word's tokens are placed starting at timestamp * frame_rate + delay.
 """
 import os
 import json
@@ -22,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict
 from transformers import AutoTokenizer
 
 import sys
@@ -31,19 +24,10 @@ from config import DsmAsrConfig
 
 
 class DsmAsrDataset(Dataset):
-    """
-    Each sample returns parallel streams:
-    - audio_tokens: [T, Q] codebook indices
-    - text_tokens:  [T] text stream (mostly PAD, text tokens placed with delay)
-    - text_targets: [T] next-token prediction targets (-100 for ignored)
-    - loss_mask:    [T] 1.0 where we compute loss
-    """
-
     def __init__(self, config: DsmAsrConfig, split="train",
                  max_samples=None, tokenizer=None):
         super().__init__()
         self.config = config
-        self.split = split
 
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -53,17 +37,14 @@ class DsmAsrDataset(Dataset):
             self.tokenizer.add_special_tokens(
                 {"additional_special_tokens": config.special_tokens})
 
-        # Special token IDs
         self.pad_id = self.tokenizer.convert_tokens_to_ids("<|pad|>")
         self.epad_id = self.tokenizer.convert_tokens_to_ids("<|epad|>")
         self.bos_id = self.tokenizer.convert_tokens_to_ids("<|bos|>")
         self.eos_id = self.tokenizer.convert_tokens_to_ids("<|eos|>")
 
-        # Load manifest
         manifest_path = Path(config.preprocessed_dir) / "manifest.json"
         if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Manifest not found: {manifest_path}. Run prepare_data.py first.")
+            raise FileNotFoundError(f"Run prepare_data.py first: {manifest_path}")
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
         self.samples = manifest["samples"]
@@ -77,110 +58,148 @@ class DsmAsrDataset(Dataset):
 
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
-
         print(f"📂 DsmAsrDataset [{split}]: {len(self.samples)} samples")
 
     def __len__(self):
         return len(self.samples)
 
-    def _build_text_stream(self, text: str, T: int) -> tuple:
+    def _build_text_stream_with_timestamps(self, data, T):
         """
-        Build the text stream aligned to audio frames.
-        
-        Strategy (simplified from paper):
-        - Tokenize text → [tok_1, ..., tok_N]
-        - Text starts at frame `delay_frames` (audio has head start)
-        - Spread tokens evenly across frames [delay, T-1]
-        - Insert EPAD before each word burst, PAD everywhere else
-
-        Returns:
-            text_tokens: [T] tensor
-            text_targets: [T] tensor (shifted by 1)
-            loss_mask: [T] tensor
+        Build text stream using real word-level timestamps.
+        Matches the Moshi paper exactly:
+        - Each word placed at start_frame + delay
+        - EPAD before each word
+        - PAD everywhere else
+        - BOS at start, EOS at end
         """
         delay = self.config.delay_frames
-        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        frame_rate = self.config.frame_rate
 
-        if not text_ids:
-            text_ids = [self.eos_id]
+        # Load timestamps
+        word_starts = data.get("word_starts", np.array([]))
+        word_texts = data.get("word_texts", np.array([]))
 
-        # Add BOS at start, EOS at end
-        text_ids = [self.bos_id] + text_ids + [self.eos_id]
+        if len(word_starts) == 0 or len(word_texts) == 0:
+            # Fallback: no timestamps, spread text evenly
+            return self._build_text_stream_fallback(str(data["text"]), T)
 
-        # Available frames for text (after delay)
-        available_frames = T - delay
-        if available_frames <= 0:
-            available_frames = T
-            delay = 0
+        # Initialize with PAD
+        text_stream = [self.pad_id] * T
+        loss_mask = [0.0] * T
 
-        # Cap text length
-        if len(text_ids) > available_frames:
-            text_ids = text_ids[:available_frames - 1] + [self.eos_id]
+        # Place BOS at frame 0 + delay
+        bos_frame = min(delay, T - 1)
+        text_stream[bos_frame] = self.bos_id
+        loss_mask[bos_frame] = 1.0
 
-        N = len(text_ids)
+        # Place each word at its timestamp position + delay
+        for i, (start_sec, word_text) in enumerate(zip(word_starts, word_texts)):
+            word_str = str(word_text).strip()
+            if not word_str:
+                continue
 
-        # Initialize text stream with PAD
-        text_tokens = torch.full((T,), self.pad_id, dtype=torch.long)
-        loss_mask = torch.zeros(T, dtype=torch.float32)
+            # Tokenize this word
+            word_ids = self.tokenizer.encode(word_str, add_special_tokens=False)
+            if not word_ids:
+                continue
 
-        # Spread text tokens evenly across [delay, delay + available - 1]
-        if N <= available_frames:
-            # Calculate positions — spread evenly
-            if N == 1:
-                positions = [delay]
-            else:
-                positions = [delay + int(i * (available_frames - 1) / (N - 1))
-                            for i in range(N)]
-                # Ensure no duplicates
-                seen = set()
-                clean_positions = []
-                for p in positions:
-                    while p in seen and p < T - 1:
-                        p += 1
-                    if p < T:
-                        seen.add(p)
-                        clean_positions.append(p)
-                positions = clean_positions
+            # Convert timestamp to frame index + delay
+            start_frame = int(start_sec * frame_rate) + delay
 
-            # Place text tokens at positions
-            for i, pos in enumerate(positions):
-                if i < N and pos < T:
-                    # Insert EPAD before text token (if there's room)
-                    if pos > 0 and text_tokens[pos - 1] == self.pad_id:
-                        text_tokens[pos - 1] = self.epad_id
-                    text_tokens[pos] = text_ids[i]
-                    loss_mask[pos] = 1.0
+            if start_frame >= T:
+                continue
 
-        # Build targets: shifted by 1 (predict next token)
-        text_targets = torch.full((T,), -100, dtype=torch.long)
-        # For positions with loss, the target is the NEXT text token
-        active_positions = (loss_mask == 1.0).nonzero(as_tuple=True)[0].tolist()
-        for idx in range(len(active_positions)):
-            pos = active_positions[idx]
-            if idx + 1 < len(active_positions):
-                # Target = next text token
-                next_pos = active_positions[idx + 1]
-                text_targets[pos] = text_tokens[next_pos]
-            else:
-                # Last text token — target is EOS
-                text_targets[pos] = self.eos_id
+            # Insert EPAD before word (if room)
+            epad_frame = start_frame - 1
+            if epad_frame >= 0 and text_stream[epad_frame] == self.pad_id:
+                text_stream[epad_frame] = self.epad_id
+                loss_mask[epad_frame] = 0.5  # Lower weight for EPAD
 
-        # Also compute loss on EPAD and PAD positions between text tokens
-        # so model learns WHEN to output text vs padding
+            # Place word tokens starting at start_frame
+            for j, tok_id in enumerate(word_ids):
+                pos = start_frame + j
+                if pos < T and text_stream[pos] == self.pad_id:
+                    text_stream[pos] = tok_id
+                    loss_mask[pos] = 1.0  # Full weight for real text
+
+        # Place EOS after last text token
+        last_text_pos = 0
+        for pos in range(T - 1, -1, -1):
+            if loss_mask[pos] == 1.0 and text_stream[pos] != self.bos_id:
+                last_text_pos = pos
+                break
+        eos_pos = min(last_text_pos + 1, T - 1)
+        text_stream[eos_pos] = self.eos_id
+        loss_mask[eos_pos] = 1.0
+
+        # Add low-weight loss on PAD positions so model learns timing
         for t in range(T):
             if loss_mask[t] == 0.0:
-                # For PAD/EPAD positions, model should predict PAD or EPAD
-                if t + 1 < T:
-                    text_targets[t] = text_tokens[t + 1]
-                    loss_mask[t] = 0.5  # Lower weight for padding prediction
+                loss_mask[t] = 0.3  # Lighter weight for PAD prediction
+
+        text_tokens = torch.tensor(text_stream, dtype=torch.long)
+        loss_mask = torch.tensor(loss_mask, dtype=torch.float32)
+
+        # Targets: next-token prediction
+        text_targets = torch.full((T,), -100, dtype=torch.long)
+        for t in range(T - 1):
+            text_targets[t] = text_tokens[t + 1]
 
         return text_tokens, text_targets, loss_mask
 
+    def _build_text_stream_fallback(self, text, T):
+        """Fallback when no timestamps — spread text evenly with delay."""
+        delay = self.config.delay_frames
+        text_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if not text_ids:
+            text_ids = [self.eos_id]
+        text_ids = [self.bos_id] + text_ids + [self.eos_id]
+
+        available = T - delay
+        if available <= 0:
+            available = T
+            delay = 0
+        if len(text_ids) > available:
+            text_ids = text_ids[:available - 1] + [self.eos_id]
+
+        N = len(text_ids)
+        text_stream = [self.pad_id] * T
+        loss_mask = [0.3] * T  # Low weight for all PAD
+
+        if N == 1:
+            positions = [delay]
+        else:
+            positions = [delay + int(i * (available - 1) / (N - 1)) for i in range(N)]
+            seen = set()
+            clean = []
+            for p in positions:
+                while p in seen and p < T - 1:
+                    p += 1
+                if p < T:
+                    seen.add(p)
+                    clean.append(p)
+            positions = clean
+
+        for i, pos in enumerate(positions):
+            if i < N and pos < T:
+                if pos > 0 and text_stream[pos - 1] == self.pad_id:
+                    text_stream[pos - 1] = self.epad_id
+                    loss_mask[pos - 1] = 0.5
+                text_stream[pos] = text_ids[i]
+                loss_mask[pos] = 1.0
+
+        text_tokens = torch.tensor(text_stream, dtype=torch.long)
+        loss_mask_t = torch.tensor(loss_mask, dtype=torch.float32)
+        text_targets = torch.full((T,), -100, dtype=torch.long)
+        for t in range(T - 1):
+            text_targets[t] = text_tokens[t + 1]
+
+        return text_tokens, text_targets, loss_mask_t
+
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        sample_info = self.samples[idx]
-        data = np.load(sample_info["path"], allow_pickle=True)
+        info = self.samples[idx]
+        data = dict(np.load(info["path"], allow_pickle=True))
         audio_codes = torch.from_numpy(data["audio_codes"].astype(np.int64))
-        text = str(data["text"])
 
         T = audio_codes.shape[0]
         max_T = self.config.max_frames
@@ -188,40 +207,27 @@ class DsmAsrDataset(Dataset):
             audio_codes = audio_codes[:max_T]
             T = max_T
 
-        text_tokens, text_targets, loss_mask = self._build_text_stream(text, T)
+        text_tokens, text_targets, loss_mask = \
+            self._build_text_stream_with_timestamps(data, T)
 
         return {
-            "audio_tokens": audio_codes,       # [T, Q]
-            "text_tokens": text_tokens,         # [T]
-            "text_targets": text_targets,       # [T]
-            "loss_mask": loss_mask,             # [T]
+            "audio_tokens": audio_codes,
+            "text_tokens": text_tokens,
+            "text_targets": text_targets,
+            "loss_mask": loss_mask,
         }
 
 
-def test_dataset():
+if __name__ == "__main__":
     config = DsmAsrConfig()
     ds = DsmAsrDataset(config, split="train", max_samples=3)
     if len(ds) == 0:
-        print("⚠️  No samples. Run prepare_data.py first.")
-        return
-
-    sample = ds[0]
-    T = sample["audio_tokens"].shape[0]
-    print(f"\n  audio: {sample['audio_tokens'].shape}")
-    print(f"  text_tokens: {sample['text_tokens'].shape}")
-    print(f"  Total frames: {T}")
-
-    text_positions = (sample["loss_mask"] >= 0.5).sum().item()
-    real_text = (sample["loss_mask"] == 1.0).sum().item()
-    print(f"  Text positions: {real_text} / {T}")
-
-    # Decode text tokens
-    text_ids = sample["text_tokens"][sample["loss_mask"] == 1.0].tolist()
-    decoded = ds.tokenizer.decode(text_ids, skip_special_tokens=True)
-    print(f"  Decoded: {decoded[:100]}...")
-
-    print("\n✅ Dataset test PASSED!")
-
-
-if __name__ == "__main__":
-    test_dataset()
+        print("⚠️  No samples")
+    else:
+        s = ds[0]
+        T = s["audio_tokens"].shape[0]
+        real = (s["loss_mask"] == 1.0).sum().item()
+        print(f"  T={T}, text_positions={real}")
+        ids = s["text_tokens"][s["loss_mask"] == 1.0].tolist()
+        print(f"  Decoded: {ds.tokenizer.decode(ids, skip_special_tokens=True)[:100]}...")
+        print("✅ Dataset test PASSED")
