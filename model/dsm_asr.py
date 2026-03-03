@@ -39,24 +39,28 @@ class DsmAsrModel(nn.Module):
             attn_implementation="sdpa",
         )
 
-        # Extend vocabulary to include special tokens + audio tokens
-        if tokenizer is not None:
-            new_vocab_size = len(tokenizer)
-            old_vocab_size = self.backbone.config.vocab_size
-            self.backbone.resize_token_embeddings(new_vocab_size)
-            # Initialize new token embeddings with small noise (not zero)
+        # Extend vocabulary: MUST resize to total_vocab_size (text + special + audio)
+        # config.total_vocab_size = 151,671 + 4 + 16,384 = 168,059
+        # NOTE: len(tokenizer) is only 151,675 (text + 4 special) — NOT sufficient!
+        #       Audio token IDs go up to 168,058, so we must resize to 168,059.
+        target_vocab_size = config.total_vocab_size  # 168,059
+        old_vocab_size = self.backbone.config.vocab_size
+        self.backbone.resize_token_embeddings(target_vocab_size)
+        # Initialize ALL new token embeddings with small Gaussian noise
+        with torch.no_grad():
+            emb = self.backbone.model.embed_tokens.weight
+            if target_vocab_size > old_vocab_size:
+                nn.init.normal_(emb[old_vocab_size:], mean=0.0, std=0.02)
+        # Also resize and initialize the LM head
+        if hasattr(self.backbone, 'lm_head'):
             with torch.no_grad():
-                emb = self.backbone.model.embed_tokens.weight
-                if new_vocab_size > old_vocab_size:
-                    nn.init.normal_(emb[old_vocab_size:], mean=0.0, std=0.02)
-            # Also initialize the LM head for new tokens
-            if hasattr(self.backbone, 'lm_head'):
-                with torch.no_grad():
-                    lm = self.backbone.lm_head.weight
-                    if new_vocab_size > old_vocab_size:
-                        nn.init.normal_(lm[old_vocab_size:], mean=0.0, std=0.02)
-            print(f"   Vocab: {old_vocab_size:,} → {new_vocab_size:,} "
-                  f"(+{new_vocab_size - old_vocab_size:,} audio/special tokens)")
+                lm = self.backbone.lm_head.weight
+                if target_vocab_size > old_vocab_size:
+                    nn.init.normal_(lm[old_vocab_size:], mean=0.0, std=0.02)
+        print(f"   Vocab: {old_vocab_size:,} → {target_vocab_size:,}")
+        print(f"     text={config.text_vocab_size:,}  "
+              f"special={config.num_extra_special}  "
+              f"audio={config.audio_vocab_size:,}")
 
         self.text_vocab = config.text_vocab_size
         n_params = sum(p.numel() for p in self.backbone.parameters())
