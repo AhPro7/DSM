@@ -70,13 +70,16 @@ class DsmAsrDataset(Dataset):
         info = self.samples[idx]
         data = np.load(info["path"], allow_pickle=True)
 
-        # 1D flat audio token IDs (raw 0..16383, add offset for vocab)
-        raw_flat = data["audio_flat"].astype(np.int64)
-        max_audio_toks = self.config.max_frames * self.config.num_codebooks
-        if len(raw_flat) > max_audio_toks:
-            # Truncate to whole frames
-            raw_flat = raw_flat[:max_audio_toks]
-        audio_vocab_ids = raw_flat + self.config.audio_token_offset  # shift into vocab
+        # Shift raw flat ids (0..16383) into vocabulary range
+        audio_vocab_ids = raw_flat + self.config.audio_token_offset
+
+        # Safety check — catch OOB on CPU before it reaches the GPU
+        max_id = audio_vocab_ids.max() if len(audio_vocab_ids) > 0 else 0
+        expected_max = self.config.total_vocab_size - 1
+        assert max_id <= expected_max, (
+            f"Audio token ID {max_id} exceeds vocab size {self.config.total_vocab_size}. "
+            f"Check config: offset={self.config.audio_token_offset}, "
+            f"audio_vocab={self.config.audio_vocab_size}")
 
         # Tokenize text
         text = str(data["text"]).strip()
